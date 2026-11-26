@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>rprobe · 主机概览</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; background: #0b1020; color: #e7ecf5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: radial-gradient(ellipse at top left, #182748, transparent 48%), #0b1020; }
+    header, main { width: min(1160px, calc(100% - 32px)); margin: 0 auto; }
+    header { padding: 30px 0 22px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    h1 { margin: 0; font-size: 24px; letter-spacing: -.04em; } h1 span { color: #6ee7c0; }
+    .subtle { color: #91a0bb; font-size: 13px; }
+    button, input { border: 1px solid #34415d; border-radius: 9px; background: #121b30; color: #e7ecf5; padding: 10px 12px; font: inherit; }
+    button { cursor: pointer; font-weight: 650; } button:hover { border-color: #6ee7c0; }
+    .login { display: flex; gap: 8px; } .login input { width: min(270px, 50vw); }
+    main { padding-bottom: 48px; }
+    #notice { min-height: 22px; color: #f5c36a; font-size: 13px; margin-bottom: 12px; }
+    .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 26px; }
+    .summary article, .host { border: 1px solid #26334e; background: rgba(16, 25, 45, .88); border-radius: 14px; }
+    .summary article { padding: 16px 18px; } .summary strong { display: block; font-size: 26px; margin-top: 5px; }
+    .group { margin: 22px 0; } .group summary { cursor: pointer; padding: 10px 2px 12px; font-weight: 700; color: #e7ecf5; }
+    .group summary small { margin-left: 9px; color: #91a0bb; font-weight: 400; }
+    .hosts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); gap: 12px; }
+    .host { padding: 16px; } .host.offline { border-color: #753b49; opacity: .78; }
+    .host-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .host h2 { margin: 0; font-size: 17px; overflow-wrap: anywhere; } .host .identity { margin-top: 4px; font-size: 12px; color: #91a0bb; }
+    .badge { border-radius: 999px; padding: 4px 8px; font-size: 11px; background: #143d37; color: #6ee7c0; white-space: nowrap; }
+    .offline .badge { background: #492832; color: #ff9ca8; }
+    .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 11px 16px; margin: 18px 0; }
+    .metric label { display: block; color: #91a0bb; font-size: 11px; margin-bottom: 3px; }
+    .metric strong { font-size: 14px; font-weight: 650; }
+    .host-foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding-top: 12px; border-top: 1px solid #26334e; color: #91a0bb; font-size: 11px; }
+    select { background: #121b30; border: 1px solid #34415d; border-radius: 7px; color: #dce5f5; padding: 6px; max-width: 140px; }
+    .toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    #empty { color:#91a0bb; border:1px dashed #34415d; border-radius:14px; padding:30px; text-align:center; }
+    @media (max-width: 640px) { header { align-items:flex-start; flex-direction:column; } .login { width:100%; } .login input { flex:1; } .summary { gap:8px; } .summary article { padding:12px; } .summary strong { font-size:21px; } }
+  </style>
+</head>
+<body>
+<header>
+  <div><h1><span>rprobe</span> / 主机概览</h1><div class="subtle" id="updated">等待连接</div></div>
+  <form class="login" id="login"><input id="token" type="password" autocomplete="current-password" placeholder="管理员 Token" aria-label="管理员 Token"><button type="submit">连接</button></form>
+</header>
+<main>
+  <div id="notice" role="status"></div>
+  <div class="toolbar"><div id="summary" class="summary" style="flex:1"></div><button id="add-group" type="button">＋ 新建分组</button></div>
+  <div id="groups"></div>
+</main>
+<script>
+(() => {
+  const tokenInput = document.querySelector('#token');
+  const tokenKey = 'rprobe-admin-token';
+  let token = sessionStorage.getItem(tokenKey) || '';
+  let source;
+  tokenInput.value = token;
+  const notice = (text = '') => { document.querySelector('#notice').textContent = text; };
+  const auth = { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } };
+  async function api(path, options = {}) {
+    auth.headers.Authorization = `Bearer ${token}`;
+    const response = await fetch(path, { ...options, headers: { ...auth.headers, ...(options.headers || {}) } });
+    if (!response.ok) throw new Error(response.status === 401 ? '管理员 Token 无效或未授权。' : `请求失败：HTTP ${response.status}`);
+    return response.status === 204 ? null : response.json();
+  }
+  const fmtBytes = (value) => {
+    if (!Number.isFinite(value) || value <= 0) return '—';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB']; let n = value, i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+  };
+  const metric = (label, value) => {
+    const wrapper = document.createElement('div'); wrapper.className = 'metric';
+    const caption = document.createElement('label'); caption.textContent = label;
+    const strong = document.createElement('strong'); strong.textContent = value;
+    wrapper.append(caption, strong); return wrapper;
+  };
+  function hostCard(host, groups) {
+    const card = document.createElement('article'); card.className = `host${host.online ? '' : ' offline'}`;
+    const head = document.createElement('div'); head.className = 'host-head';
+    const title = document.createElement('div');
+    const name = document.createElement('h2'); name.textContent = host.hello.hostname || host.hello.agent_id;
+    const identity = document.createElement('div'); identity.className = 'identity'; identity.textContent = `${host.hello.agent_id} · ${host.hello.virtualization} · ${host.hello.os}`;
+    title.append(name, identity);
+    const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = host.online ? '在线' : '离线';
+    head.append(title, badge);
+    const report = host.report;
+    const metrics = document.createElement('div'); metrics.className = 'metrics';
+    const memoryPct = report && report.memory_limit_bytes ? (report.memory_used_bytes / report.memory_limit_bytes * 100).toFixed(0) + '%' : '—';
+    const diskPct = report && report.disk_total_bytes ? (report.disk_used_bytes / report.disk_total_bytes * 100).toFixed(0) + '%' : '—';
+    metrics.append(
+      metric('CPU', report ? `${report.cpu_percent.toFixed(1)}%` : '等待上报'),
+      metric('内存', report ? `${memoryPct} · ${fmtBytes(report.memory_used_bytes)} / ${fmtBytes(report.memory_limit_bytes)}` : '—'),
+      metric('磁盘', report ? `${diskPct} · ${fmtBytes(report.disk_used_bytes)} / ${fmtBytes(report.disk_total_bytes)}` : '—'),
+      metric('负载 / TCP / UDP', report ? `${report.load1.toFixed(2)} · ${report.tcp_connections} / ${report.udp_connections}` : '—'),
+      metric('网络实时 RX / TX', report ? `${fmtBytes(report.rx_bytes_per_sec)}/s · ${fmtBytes(report.tx_bytes_per_sec)}/s` : '—'),
+      metric('累计流量 RX / TX', report ? `${fmtBytes(report.rx_bytes_total)} · ${fmtBytes(report.tx_bytes_total)}` : '—'),
+    );
+    const foot = document.createElement('div'); foot.className = 'host-foot';
+    const uptime = document.createElement('span'); uptime.textContent = report ? `运行 ${Math.floor(report.uptime_secs / 86400)} 天 · ${report.process_count} 进程` : `最近上报 ${new Date(host.last_seen_at * 1000).toLocaleTimeString()}`;
+    const select = document.createElement('select'); select.setAttribute('aria-label', `设置 ${name.textContent} 的分组`);
+    const none = document.createElement('option'); none.value = ''; none.textContent = '未分组'; select.append(none);
+    for (const group of groups) { const option = document.createElement('option'); option.value = group.id; option.textContent = group.name; select.append(option); }
+    select.value = host.group_id || '';
+    select.addEventListener('change', async () => {
+      try { await api(`/api/hosts/${encodeURIComponent(host.hello.agent_id)}/group`, { method: 'PATCH', body: JSON.stringify({ group_id: select.value || null }) }); await refresh(); }
+      catch (error) { notice(error.message); }
+    });
+    foot.append(uptime, select); card.append(head, metrics, foot); return card;
+  }
+  async function refresh() {
+    if (!token) { notice('输入管理员 Token 后查看主机数据。'); return; }
+    try {
+      const data = await api('/api/overview');
+      notice('');
+      document.querySelector('#updated').textContent = `最后更新 ${new Date(data.generated_at * 1000).toLocaleTimeString()}`;
+      const online = data.hosts.filter(host => host.online).length;
+      const summary = document.querySelector('#summary'); summary.replaceChildren();
+      for (const [label, value] of [['主机总数', data.hosts.length], ['在线', online], ['离线', data.hosts.length - online]]) {
+        const item = document.createElement('article'); const small = document.createElement('span'); small.className = 'subtle'; small.textContent = label;
+        const strong = document.createElement('strong'); strong.textContent = value; item.append(small, strong); summary.append(item);
+      }
+      const root = document.querySelector('#groups'); root.replaceChildren();
+      const ordered = [...data.groups].sort((a, b) => a.sort - b.sort || a.name.localeCompare(b.name));
+      for (const group of ordered) {
+        const hosts = data.hosts.filter(host => host.group_id === group.id);
+        if (group.parent_id) continue;
+        const section = document.createElement('details'); section.className = 'group'; section.open = true;
+        const summary = document.createElement('summary'); summary.textContent = group.name;
+        const count = document.createElement('small'); count.textContent = `${hosts.filter(host => host.online).length} 在线 / ${hosts.length} 台`;
+        summary.append(count); section.append(summary);
+        const cards = document.createElement('div'); cards.className = 'hosts';
+        for (const host of hosts) cards.append(hostCard(host, ordered));
+        for (const child of ordered.filter(item => item.parent_id === group.id)) {
+          const childHosts = data.hosts.filter(host => host.group_id === child.id);
+          const label = document.createElement('h3'); label.className = 'subtle'; label.textContent = `${child.name} · ${childHosts.filter(host => host.online).length} 在线 / ${childHosts.length} 台`;
+          section.append(label); for (const host of childHosts) cards.append(hostCard(host, ordered));
+        }
+        section.append(cards); root.append(section);
+      }
+      const ungrouped = data.hosts.filter(host => !host.group_id || !data.groups.some(group => group.id === host.group_id));
+      if (ungrouped.length) {
+        const section = document.createElement('details'); section.className = 'group'; section.open = true;
+        const summary = document.createElement('summary'); summary.textContent = `未分组 · ${ungrouped.length} 台`; section.append(summary);
+        const cards = document.createElement('div'); cards.className = 'hosts'; for (const host of ungrouped) cards.append(hostCard(host, ordered)); section.append(cards); root.append(section);
+      }
+      if (!data.hosts.length) { const empty = document.createElement('div'); empty.id = 'empty'; empty.textContent = '尚未收到 agent 上报。'; root.append(empty); }
+      if (source) source.close();
+      source = new EventSource('/api/events'); source.addEventListener('update', refresh);
+    } catch (error) { notice(error.message); }
+  }
+  document.querySelector('#login').addEventListener('submit', (event) => {
+    event.preventDefault(); token = tokenInput.value.trim(); sessionStorage.setItem(tokenKey, token); refresh();
+  });
+  document.querySelector('#add-group').addEventListener('click', async () => {
+    const name = prompt('分组名称'); if (!name || !name.trim()) return;
+    try { await api('/api/groups', { method: 'POST', body: JSON.stringify({ name: name.trim() }) }); await refresh(); }
+    catch (error) { notice(error.message); }
+  });
+  if (token) refresh();
+  setInterval(() => { if (token && (!source || source.readyState === EventSource.CLOSED)) refresh(); }, 5000);
+})();
+</script>
+</body>
+</html>

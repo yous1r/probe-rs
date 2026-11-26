@@ -1,0 +1,21 @@
+[package]
+name = "rprobe-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+rprobe-common = { path = "../common" }
+serde.workspace = true
+serde_json.workspace = true
+subtle = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "signal"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+rand_core = { version = "0.6", features = ["getrandom"] }

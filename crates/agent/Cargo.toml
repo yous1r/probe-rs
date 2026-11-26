@@ -1,0 +1,15 @@
+[package]
+name = "rprobe-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+anyhow = "1"
+rprobe-common = { path = "../common" }
+serde_json.workspace = true
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

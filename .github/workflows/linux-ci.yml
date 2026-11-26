@@ -1,0 +1,57 @@
+name: Linux CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-musl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: always
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust and musl tools
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal --component clippy,rustfmt --target "$TARGET"
+          rustup default 1.100.0
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint Linux targets
+        run: cargo clippy --locked --workspace --all-targets --target "$TARGET" -- -D warnings
+      - name: Test on Linux musl
+        run: cargo test --locked --workspace --target "$TARGET"
+      - name: Build release binaries
+        run: cargo build --locked --release --workspace --target "$TARGET"
+      - name: Package traceable artifacts
+        run: |
+          mkdir -p dist
+          cp "target/$TARGET/release/rprobe-agent" "target/$TARGET/release/rprobe-server" dist/
+          printf '%s\n' "$GITHUB_SHA" > dist/COMMIT
+          rustc -vV > dist/TOOLCHAIN.txt
+          file dist/rprobe-agent dist/rprobe-server | tee dist/BINARIES.txt
+          if readelf -l dist/rprobe-agent dist/rprobe-server | grep -q INTERP; then
+            echo 'Expected static binaries without a dynamic interpreter' >&2
+            exit 1
+          fi
+          cd dist
+          sha256sum rprobe-agent rprobe-server COMMIT TOOLCHAIN.txt BINARIES.txt > SHA256SUMS
+          tar -czf "../rprobe-$TARGET.tar.gz" rprobe-agent rprobe-server COMMIT TOOLCHAIN.txt BINARIES.txt SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rprobe-x86_64-unknown-linux-musl
+          path: rprobe-x86_64-unknown-linux-musl.tar.gz
+          if-no-files-found: error
+          retention-days: 14
