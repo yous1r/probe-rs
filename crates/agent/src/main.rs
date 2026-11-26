@@ -1,3 +1,4 @@
+mod cgroup;
 mod collector;
 mod uplink;
 

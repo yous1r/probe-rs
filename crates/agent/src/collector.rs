@@ -1,3 +1,9 @@
+#[cfg(test)]
+use crate::cgroup::parse_memory_limit as parse_cgroup_memory_limit;
+use crate::cgroup::{
+    cpu_limit as cgroup_cpu_limit, cpu_usage_usec as cgroup_cpu_usage_usec,
+    memory_limit as cgroup_memory_limit, memory_usage as cgroup_memory_usage,
+};
 use anyhow::{anyhow, Result};
 use rprobe_common::{AgentHello, BeancounterStat, MetricsReport, AGENT_VERSION, PROTOCOL_VERSION};
 use std::collections::BTreeMap;
@@ -207,62 +213,6 @@ fn memory_info() -> (u64, u64, u64, u64) {
         swap_total_kb.saturating_mul(1024),
         swap_free_kb.saturating_mul(1024),
     )
-}
-
-fn cgroup_memory_limit() -> Option<u64> {
-    [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ]
-    .into_iter()
-    .find_map(|path| read_trimmed(path).and_then(|value| parse_cgroup_memory_limit(&value)))
-}
-
-fn parse_cgroup_memory_limit(value: &str) -> Option<u64> {
-    let value = value.trim().parse::<u64>().ok()?;
-    (value > 0 && value < (1_u64 << 60)).then_some(value)
-}
-
-fn cgroup_memory_usage() -> Option<u64> {
-    [
-        "/sys/fs/cgroup/memory.current",
-        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-    ]
-    .into_iter()
-    .find_map(|path| read_trimmed(path).and_then(|value| value.parse::<u64>().ok()))
-}
-
-fn cgroup_cpu_limit() -> Option<f64> {
-    if let Some(value) = read_trimmed("/sys/fs/cgroup/cpu.max") {
-        let mut parts = value.split_whitespace();
-        let quota = parts.next()?.parse::<f64>().ok()?;
-        let period = parts.next()?.parse::<f64>().ok()?;
-        if quota > 0.0 && period > 0.0 {
-            return Some(quota / period);
-        }
-    }
-    let quota = read_trimmed("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")?
-        .parse::<f64>()
-        .ok()?;
-    let period = read_trimmed("/sys/fs/cgroup/cpu/cpu.cfs_period_us")?
-        .parse::<f64>()
-        .ok()?;
-    (quota > 0.0 && period > 0.0).then_some(quota / period)
-}
-
-fn cgroup_cpu_usage_usec() -> Option<u64> {
-    if let Ok(text) = fs::read_to_string("/sys/fs/cgroup/cpu.stat") {
-        if let Some(value) = text
-            .lines()
-            .find_map(|line| line.strip_prefix("usage_usec "))
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            return Some(value);
-        }
-    }
-    read_trimmed("/sys/fs/cgroup/cpuacct/cpuacct.usage")
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|nanoseconds| nanoseconds / 1_000)
 }
 
 fn cpu_counters() -> Option<(u64, u64)> {

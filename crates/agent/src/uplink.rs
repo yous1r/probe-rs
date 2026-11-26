@@ -62,15 +62,7 @@ pub fn run(config: AgentConfig) -> Result<()> {
                 report: report.clone(),
             },
         ));
-        while pending
-            .front()
-            .is_some_and(|(timestamp, _)| collected_at.saturating_sub(*timestamp) > 300)
-        {
-            pending.pop_front();
-        }
-        while pending.len() > 60 {
-            pending.pop_front();
-        }
+        trim_pending(&mut pending, collected_at);
 
         if let Some(connected) = socket.as_mut() {
             let mut failed = false;
@@ -102,6 +94,19 @@ pub fn run(config: AgentConfig) -> Result<()> {
         }
 
         thread::sleep(config.interval);
+    }
+}
+
+fn trim_pending(pending: &mut VecDeque<(i64, ClientMessage)>, collected_at: i64) {
+    while pending
+        .front()
+        .is_some_and(|(timestamp, _)| collected_at.saturating_sub(*timestamp) > 300)
+    {
+        pending.pop_front();
+    }
+    // The CLI permits a one-second interval: five minutes need up to 301 samples.
+    while pending.len() > 301 {
+        pending.pop_front();
     }
 }
 
@@ -180,5 +185,23 @@ mod tests {
             websocket_url("http://127.0.0.1:8080"),
             "ws://127.0.0.1:8080/ws/agent"
         );
+    }
+    #[test]
+    fn retains_five_minutes_at_one_second_intervals() {
+        use super::trim_pending;
+        use crate::collector::Collector;
+        use rprobe_common::ClientMessage;
+        use std::collections::VecDeque;
+        let message = ClientMessage::Hello {
+            hello: Collector::hello("test", None),
+        };
+        let mut pending = VecDeque::new();
+        for timestamp in 0..=360 {
+            pending.push_back((timestamp, message.clone()));
+            trim_pending(&mut pending, timestamp);
+        }
+        assert_eq!(pending.len(), 301);
+        assert_eq!(pending.front().unwrap().0, 60);
+        assert_eq!(pending.back().unwrap().0, 360);
     }
 }
