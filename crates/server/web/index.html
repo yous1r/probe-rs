@@ -52,17 +52,146 @@
 <script>
 (() => {
   const tokenInput = document.querySelector('#token');
-  const tokenKey = 'rprobe-admin-token';
-  let token = sessionStorage.getItem(tokenKey) || '';
-  let source;
-  tokenInput.value = token;
+  const addGroup = document.querySelector('#add-group');
+  const groupsRoot = document.querySelector('#groups');
+  let activeSession = null;
+  // Remove credentials saved by earlier versions; new tokens stay in page memory.
+  try { sessionStorage.removeItem('rprobe-admin-token'); } catch {}
   const notice = (text = '') => { document.querySelector('#notice').textContent = text; };
-  const auth = { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } };
-  async function api(path, options = {}) {
-    auth.headers.Authorization = `Bearer ${token}`;
-    const response = await fetch(path, { ...options, headers: { ...auth.headers, ...(options.headers || {}) } });
-    if (!response.ok) throw new Error(response.status === 401 ? '管理员 Token 无效或未授权。' : `请求失败：HTTP ${response.status}`);
-    return response.status === 204 ? null : response.json();
+  const isCurrent = (session) => session && activeSession === session && !session.controller.signal.aborted;
+  function assertCurrent(session) {
+    if (!isCurrent(session)) throw new DOMException('连接已关闭。', 'AbortError');
+  }
+  function disconnect(message = '输入管理员 Token 后查看主机数据。') {
+    const previous = activeSession;
+    activeSession = null;
+    if (previous) {
+      previous.token = '';
+      previous.refreshQueued = false;
+      previous.controller.abort();
+    }
+    document.querySelector('#summary').replaceChildren();
+    groupsRoot.replaceChildren();
+    document.querySelector('#updated').textContent = '等待连接';
+    addGroup.disabled = true;
+    notice(message);
+  }
+  function checkResponse(session, response) {
+    assertCurrent(session);
+    if (response.status === 401) {
+      disconnect('管理员 Token 无效或未授权。');
+      throw new DOMException('连接已关闭。', 'AbortError');
+    }
+    if (!response.ok) throw new Error(`请求失败：HTTP ${response.status}`);
+  }
+  function errorMessage(error) {
+    if (error.name === 'TypeError') return '连接失败，请检查网络后重试。';
+    if (error.name === 'SyntaxError') return '服务器响应格式无效。';
+    return error.message || '请求失败，请稍后重试。';
+  }
+  function reportError(session, error) {
+    if (isCurrent(session) && error.name !== 'AbortError') notice(errorMessage(error));
+  }
+  async function api(session, path, options = {}) {
+    assertCurrent(session);
+    const response = await fetch(path, {
+      ...options,
+      headers: { ...options.headers, Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' },
+      signal: session.controller.signal,
+      cache: 'no-store',
+    });
+    checkResponse(session, response);
+    if (response.status === 204) return null;
+    const body = await response.text();
+    assertCurrent(session);
+    return body.trim() ? JSON.parse(body) : null;
+  }
+  function retryAfter(session, delay) {
+    if (!isCurrent(session)) return Promise.resolve();
+    return new Promise(resolve => {
+      const signal = session.controller.signal;
+      const finish = () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, delay);
+      signal.addEventListener('abort', finish, { once: true });
+      if (signal.aborted) finish();
+    });
+  }
+  async function readEvents(session, response, onUpdate) {
+    if (!response.body) throw new Error('浏览器无法读取实时事件流。');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let line = '', eventType = '', eventData = [], eventSize = 0, skipLF = false;
+    const consumeLine = () => {
+      if (!line) {
+        if (eventType === 'update' && eventData.join('\n') === 'refresh') onUpdate();
+        eventType = ''; eventData = []; eventSize = 0;
+        return;
+      }
+      eventSize += line.length;
+      if (eventSize > 65536) throw new Error('实时事件超出大小限制。');
+      if (line.startsWith(':')) return;
+      const colon = line.indexOf(':');
+      const field = colon < 0 ? line : line.slice(0, colon);
+      let value = colon < 0 ? '' : line.slice(colon + 1);
+      if (value.startsWith(' ')) value = value.slice(1);
+      if (field === 'event') eventType = value;
+      if (field === 'data') eventData.push(value);
+    };
+    try {
+      while (isCurrent(session)) {
+        const { value, done } = await reader.read();
+        assertCurrent(session);
+        const chunk = done ? decoder.decode() : decoder.decode(value, { stream: true });
+        for (const char of chunk) {
+          if (skipLF) { skipLF = false; if (char === '\n') continue; }
+          if (char === '\r' || char === '\n') {
+            consumeLine(); line = ''; skipLF = char === '\r';
+          } else {
+            line += char;
+            if (line.length > 65536) throw new Error('实时事件超出大小限制。');
+          }
+        }
+        if (done) return;
+      }
+    } finally {
+      try { await reader.cancel(); } catch {}
+      reader.releaseLock();
+    }
+  }
+  async function watchEvents(session) {
+    let delay = 1000, reconnecting = false;
+    while (isCurrent(session)) {
+      try {
+        const response = await fetch('/api/events', {
+          headers: { Authorization: `Bearer ${session.token}`, Accept: 'text/event-stream' },
+          signal: session.controller.signal,
+          cache: 'no-store',
+        });
+        checkResponse(session, response);
+        if (!response.headers.get('Content-Type')?.toLowerCase().startsWith('text/event-stream')) {
+          throw new Error('实时连接返回格式错误。');
+        }
+        session.reconnecting = false;
+        notice('');
+        if (reconnecting) void refresh(session);
+        await readEvents(session, response, () => {
+          delay = 1000;
+          void refresh(session);
+        });
+        if (isCurrent(session)) throw new Error('实时连接已断开。');
+      } catch (error) {
+        if (!isCurrent(session)) return;
+        session.reconnecting = true;
+        notice(`${errorMessage(error)} ${delay / 1000} 秒后重试实时连接。`);
+      }
+      await retryAfter(session, delay);
+      delay = Math.min(delay * 2, 30000);
+      reconnecting = true;
+    }
   }
   const fmtBytes = (value) => {
     if (!Number.isFinite(value) || value <= 0) return '—';
@@ -76,7 +205,7 @@
     const strong = document.createElement('strong'); strong.textContent = value;
     wrapper.append(caption, strong); return wrapper;
   };
-  function hostCard(host, groups) {
+  function hostCard(session, host, groups) {
     const card = document.createElement('article'); card.className = `host${host.online ? '' : ' offline'}`;
     const head = document.createElement('div'); head.className = 'host-head';
     const title = document.createElement('div');
@@ -104,62 +233,116 @@
     for (const group of groups) { const option = document.createElement('option'); option.value = group.id; option.textContent = group.name; select.append(option); }
     select.value = host.group_id || '';
     select.addEventListener('change', async () => {
-      try { await api(`/api/hosts/${encodeURIComponent(host.hello.agent_id)}/group`, { method: 'PATCH', body: JSON.stringify({ group_id: select.value || null }) }); await refresh(); }
-      catch (error) { notice(error.message); }
+      if (!isCurrent(session)) return;
+      select.disabled = true;
+      try {
+        await api(session, `/api/hosts/${encodeURIComponent(host.hello.agent_id)}/group`, { method: 'PATCH', body: JSON.stringify({ group_id: select.value || null }) });
+        void refresh(session);
+      } catch (error) {
+        if (isCurrent(session)) select.value = host.group_id || '';
+        reportError(session, error);
+      } finally {
+        if (isCurrent(session)) select.disabled = false;
+      }
     });
     foot.append(uptime, select); card.append(head, metrics, foot); return card;
   }
-  async function refresh() {
-    if (!token) { notice('输入管理员 Token 后查看主机数据。'); return; }
+  function groupSection(session, key) {
+    const section = document.createElement('details'); section.className = 'group';
+    section.dataset.groupKey = key;
+    section.open = session.groupOpen.get(key) ?? true;
+    return section;
+  }
+  function hostCards(session, hosts, groups) {
+    const cards = document.createElement('div'); cards.className = 'hosts';
+    for (const host of hosts) cards.append(hostCard(session, host, groups));
+    return cards;
+  }
+  function renderOverview(session, data) {
+    assertCurrent(session);
+    document.querySelector('#updated').textContent = `最后更新 ${new Date(data.generated_at * 1000).toLocaleTimeString()}`;
+    const online = data.hosts.filter(host => host.online).length;
+    const summary = document.querySelector('#summary'); summary.replaceChildren();
+    for (const [label, value] of [['主机总数', data.hosts.length], ['在线', online], ['离线', data.hosts.length - online]]) {
+      const item = document.createElement('article'); const small = document.createElement('span'); small.className = 'subtle'; small.textContent = label;
+      const strong = document.createElement('strong'); strong.textContent = value; item.append(small, strong); summary.append(item);
+    }
+    for (const section of groupsRoot.querySelectorAll('details[data-group-key]')) {
+      session.groupOpen.set(section.dataset.groupKey, section.open);
+    }
+    groupsRoot.replaceChildren();
+    const ordered = [...data.groups].sort((a, b) => a.sort - b.sort || a.name.localeCompare(b.name));
+    for (const group of ordered) {
+      if (group.parent_id) continue;
+      const hosts = data.hosts.filter(host => host.group_id === group.id);
+      const section = groupSection(session, `group:${group.id}`);
+      const summary = document.createElement('summary'); summary.textContent = group.name;
+      const count = document.createElement('small'); count.textContent = `${hosts.filter(host => host.online).length} 在线 / ${hosts.length} 台`;
+      summary.append(count); section.append(summary, hostCards(session, hosts, ordered));
+      for (const child of ordered.filter(item => item.parent_id === group.id)) {
+        const childHosts = data.hosts.filter(host => host.group_id === child.id);
+        const label = document.createElement('h3'); label.className = 'subtle'; label.textContent = `${child.name} · ${childHosts.filter(host => host.online).length} 在线 / ${childHosts.length} 台`;
+        section.append(label, hostCards(session, childHosts, ordered));
+      }
+      groupsRoot.append(section);
+    }
+    const ungrouped = data.hosts.filter(host => !host.group_id || !data.groups.some(group => group.id === host.group_id));
+    if (ungrouped.length) {
+      const section = groupSection(session, 'ungrouped');
+      const summary = document.createElement('summary'); summary.textContent = `未分组 · ${ungrouped.length} 台`;
+      section.append(summary, hostCards(session, ungrouped, ordered)); groupsRoot.append(section);
+    }
+    if (!data.hosts.length) { const empty = document.createElement('div'); empty.id = 'empty'; empty.textContent = '尚未收到 agent 上报。'; groupsRoot.append(empty); }
+  }
+  async function refresh(session) {
+    if (!isCurrent(session)) return;
+    session.refreshQueued = true;
+    if (session.refreshing) return;
+    session.refreshing = true;
     try {
-      const data = await api('/api/overview');
-      notice('');
-      document.querySelector('#updated').textContent = `最后更新 ${new Date(data.generated_at * 1000).toLocaleTimeString()}`;
-      const online = data.hosts.filter(host => host.online).length;
-      const summary = document.querySelector('#summary'); summary.replaceChildren();
-      for (const [label, value] of [['主机总数', data.hosts.length], ['在线', online], ['离线', data.hosts.length - online]]) {
-        const item = document.createElement('article'); const small = document.createElement('span'); small.className = 'subtle'; small.textContent = label;
-        const strong = document.createElement('strong'); strong.textContent = value; item.append(small, strong); summary.append(item);
+      while (isCurrent(session) && session.refreshQueued) {
+        session.refreshQueued = false;
+        try {
+          const data = await api(session, '/api/overview');
+          assertCurrent(session);
+          renderOverview(session, data);
+          if (!session.authenticated) {
+            session.authenticated = true;
+            tokenInput.value = '';
+            addGroup.disabled = false;
+          }
+          if (!session.reconnecting) notice('');
+        } catch (error) { reportError(session, error); }
       }
-      const root = document.querySelector('#groups'); root.replaceChildren();
-      const ordered = [...data.groups].sort((a, b) => a.sort - b.sort || a.name.localeCompare(b.name));
-      for (const group of ordered) {
-        const hosts = data.hosts.filter(host => host.group_id === group.id);
-        if (group.parent_id) continue;
-        const section = document.createElement('details'); section.className = 'group'; section.open = true;
-        const summary = document.createElement('summary'); summary.textContent = group.name;
-        const count = document.createElement('small'); count.textContent = `${hosts.filter(host => host.online).length} 在线 / ${hosts.length} 台`;
-        summary.append(count); section.append(summary);
-        const cards = document.createElement('div'); cards.className = 'hosts';
-        for (const host of hosts) cards.append(hostCard(host, ordered));
-        for (const child of ordered.filter(item => item.parent_id === group.id)) {
-          const childHosts = data.hosts.filter(host => host.group_id === child.id);
-          const label = document.createElement('h3'); label.className = 'subtle'; label.textContent = `${child.name} · ${childHosts.filter(host => host.online).length} 在线 / ${childHosts.length} 台`;
-          section.append(label); for (const host of childHosts) cards.append(hostCard(host, ordered));
-        }
-        section.append(cards); root.append(section);
-      }
-      const ungrouped = data.hosts.filter(host => !host.group_id || !data.groups.some(group => group.id === host.group_id));
-      if (ungrouped.length) {
-        const section = document.createElement('details'); section.className = 'group'; section.open = true;
-        const summary = document.createElement('summary'); summary.textContent = `未分组 · ${ungrouped.length} 台`; section.append(summary);
-        const cards = document.createElement('div'); cards.className = 'hosts'; for (const host of ungrouped) cards.append(hostCard(host, ordered)); section.append(cards); root.append(section);
-      }
-      if (!data.hosts.length) { const empty = document.createElement('div'); empty.id = 'empty'; empty.textContent = '尚未收到 agent 上报。'; root.append(empty); }
-      if (source) source.close();
-      source = new EventSource('/api/events'); source.addEventListener('update', refresh);
-    } catch (error) { notice(error.message); }
+    } finally { session.refreshing = false; }
   }
   document.querySelector('#login').addEventListener('submit', (event) => {
-    event.preventDefault(); token = tokenInput.value.trim(); sessionStorage.setItem(tokenKey, token); refresh();
+    event.preventDefault();
+    const token = tokenInput.value.trim();
+    disconnect();
+    if (!token) return;
+    const session = {
+      token, controller: new AbortController(), authenticated: false,
+      refreshing: false, refreshQueued: false, reconnecting: false, groupOpen: new Map(),
+    };
+    activeSession = session;
+    notice('正在连接…');
+    void refresh(session);
+    void watchEvents(session);
   });
-  document.querySelector('#add-group').addEventListener('click', async () => {
+  addGroup.addEventListener('click', async () => {
+    const session = activeSession;
+    if (!isCurrent(session) || !session.authenticated) return;
     const name = prompt('分组名称'); if (!name || !name.trim()) return;
-    try { await api('/api/groups', { method: 'POST', body: JSON.stringify({ name: name.trim() }) }); await refresh(); }
-    catch (error) { notice(error.message); }
+    addGroup.disabled = true;
+    try {
+      await api(session, '/api/groups', { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
+      void refresh(session);
+    } catch (error) { reportError(session, error); }
+    finally { if (isCurrent(session)) addGroup.disabled = false; }
   });
-  if (token) refresh();
-  setInterval(() => { if (token && (!source || source.readyState === EventSource.CLOSED)) refresh(); }, 5000);
+  window.addEventListener('pagehide', () => { tokenInput.value = ''; disconnect(); });
+  disconnect();
 })();
 </script>
 </body>

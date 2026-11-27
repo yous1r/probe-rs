@@ -10,27 +10,29 @@ Rust-based fleet probe. The first development slice targets milestone M1: host t
 
 ## Development run
 
-Configure the server with an agent ID/token pair and a separate dashboard token:
+Configure the server with a 0600 agent credential file (one `id=token` per line) and a separate 0600 dashboard token file:
 
 ```sh
-RPROBE_AGENT_TOKENS='node-a=replace-with-a-long-random-token' \
-RPROBE_ADMIN_TOKEN='replace-with-another-long-random-token' \
+RPROBE_AGENT_TOKENS_FILE=/etc/rprobe/agents.tokens \
+RPROBE_ADMIN_TOKEN_FILE=/etc/rprobe/admin.token \
 cargo run -p rprobe-server
 ```
 
-By default the server listens on `127.0.0.1:8080`. Put it behind an HTTPS reverse proxy for production; the agent uses `wss://` and the server accepts the upgraded WebSocket at `/ws/agent`. Plain HTTP report fallback is available at `/api/report`.
+By default the server listens on `127.0.0.1:8080`. Put it behind an HTTPS reverse proxy for production; the agent uses `wss://` at `/ws/agent` and falls back to HTTPS POST at `/api/report` on the same server. Plain HTTP is accepted by the agent only for loopback development.
 
-Run an agent with the matching identity and token:
+Create one token per agent. Store it in a file readable only by the agent's service account (`chmod 600 /etc/rprobe/agent.token`), then run:
 
 ```sh
 cargo run -p rprobe-agent -- \
   --server https://monitor.example.com \
   --id node-a \
-  --token replace-with-a-long-random-token \
+  --token-file /etc/rprobe/agent.token \
   --group free
 ```
 
-Open `/` and enter `RPROBE_ADMIN_TOKEN` to load the dashboard. Groups can be created with `POST /api/groups` and hosts reassigned with `PATCH /api/hosts/{id}/group`, both using `Authorization: Bearer <admin-token>`.
+The agent refuses token files that are group/world accessible on Unix. Passing a token directly on the command line is disabled because process listings can expose arguments.
+
+Open `/` and enter the administrator token to load the dashboard. All dashboard APIs, including `/api/events`, require this token. Groups can be created with `POST /api/groups` and hosts reassigned with `PATCH /api/hosts/{id}/group`, both using `Authorization: Bearer <admin-token>`. See [communication and security](docs/communication-security.md) for limits, TLS setup, token rotation, and remaining boundaries.
 
 ## M1 boundaries
 

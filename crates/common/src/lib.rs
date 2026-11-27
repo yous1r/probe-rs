@@ -1,3 +1,5 @@
+pub mod secret;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

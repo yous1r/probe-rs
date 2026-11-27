@@ -11,6 +11,7 @@ import math
 import os
 import platform
 import re
+import tempfile
 import secrets
 import socket
 import struct
@@ -442,6 +443,10 @@ class OwnedProcesses:
         self.output_dir = output_dir
         self.agent_token = agent_token
         self.secrets = [agent_token, admin_token]
+        with tempfile.NamedTemporaryFile(mode="w", prefix=".rprobe-token-", dir=output_dir, delete=False) as token_file:
+            os.chmod(token_file.name, 0o600)
+            token_file.write(agent_token + "\n")
+            self.agent_token_file = Path(token_file.name)
         self.entries: list[dict[str, Any]] = []
 
     def spawn(
@@ -481,18 +486,12 @@ class OwnedProcesses:
     def start_agent(self, binary: Path, name: str, url: str, interval: int = 1) -> dict[str, Any]:
         env = os.environ.copy()
         args = [
-            "--server",
-            url,
-            "--id",
-            AGENT_ID,
-            "--token",
-            self.agent_token,
-            "--group",
-            AGENT_GROUP,
-            "--interval",
-            str(interval),
+            "--server", url, "--id", AGENT_ID,
+            "--token-file", str(self.agent_token_file),
+            "--group", AGENT_GROUP, "--interval", str(interval),
         ]
         return self.spawn(name, binary, args, env)
+
 
     def stop(self, entry: dict[str, Any] | None, timeout: float = 3.0) -> None:
         if not entry or entry.get("stopped"):
@@ -513,6 +512,7 @@ class OwnedProcesses:
                 self.stop(entry)
             except Exception:
                 pass
+        self.agent_token_file.unlink(missing_ok=True)
 
     def redact_logs(self) -> None:
         for entry in self.entries:

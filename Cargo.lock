@@ -722,6 +722,7 @@ dependencies = [
  "serde_json",
  "tungstenite 0.26.2",
  "ureq",
+ "url",
 ]
 
 [[package]]
@@ -747,6 +748,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

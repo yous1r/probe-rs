@@ -1,4 +1,5 @@
 mod routes;
+mod security;
 mod state;
 
 use anyhow::Result;

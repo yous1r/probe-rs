@@ -25,6 +25,10 @@ def main():
         parser.error('--sample-secs must be at least 10')
     args.output_dir.mkdir(parents=True, exist_ok=True)
     token, admin = secrets.token_hex(24), secrets.token_hex(24)
+    token_file = (args.output_dir / ('.agent-token-' + secrets.token_hex(6))).resolve()
+    token_fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(token_fd, 'w') as token_stream:
+        token_stream.write(token + '\n')
     unit = 'rprobe-verify-' + secrets.token_hex(6)
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
@@ -55,7 +59,8 @@ def main():
                 '--property=CPUQuota=10%', '--property=MemoryMax=256M',
                 '--property=User=' + str(os.getuid()),
                 str(args.bin_dir.resolve() / 'rprobe-agent'), '--server', base_url,
-                '--id', 'limited', '--token', token, '--interval', '5'], stdout=log, stderr=log)
+                '--id', 'limited', '--token-file', str(token_file), '--interval', '5'],
+                stdout=log, stderr=log)
         request = urllib.request.Request(base_url + '/api/overview',
                                          headers={'Authorization': 'Bearer ' + admin})
         host = None
@@ -121,6 +126,7 @@ def main():
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+        token_file.unlink(missing_ok=True)
         (args.output_dir / 'verify_limits_results.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2))
     return 0 if result['status'] == 'PASS' else 1
