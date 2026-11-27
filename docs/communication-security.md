@@ -30,6 +30,7 @@ Server 支持：
 ```sh
 RPROBE_AGENT_TOKENS_FILE=/etc/rprobe/agents.tokens \
 RPROBE_ADMIN_TOKEN_FILE=/etc/rprobe/admin.token \
+RPROBE_DB_PATH=/var/lib/rprobe/rprobe.sqlite \
 RPROBE_LISTEN=127.0.0.1:8080 ./rprobe-server
 ```
 
@@ -37,7 +38,7 @@ RPROBE_LISTEN=127.0.0.1:8080 ./rprobe-server
 
 只配置允许接入的 ID，拒绝重复 ID、重复 token 或 agent/admin 共用 token。Agent token 只能写自己的状态，不能读取面板、操作其他机器或管理分组。首次 Hello 可指定初始分组；重连保留管理员分组，包括未分组。
 
-目前轮换/吊销方式为修改配置、重启 server，并更新对应 agent 文件后重启 agent；重启会关闭旧连接。没有动态吊销 API。最新状态和去重记录是内存态，重启会清空。
+目前轮换/吊销方式为修改配置、重启 server，并更新对应 agent 文件后重启 agent；重启会关闭旧连接。没有动态吊销 API。主机信息、分组、归属、最新报告与最后接收时间持久化到 SQLite，重启保留；在线状态需新的有效上报才能重新确认。删除接入凭据不会删除已保存的资产记录，原 agent 无法继续写入。
 
 ## TLS 与入口
 
@@ -73,7 +74,7 @@ Agent 使用 rustls 的正常证书链/主机名验证，无跳过验证选项�
 
 报告字段有字符串、集合和数字范围检查。接收时间为在线时间依据；允许采集时间落在服务端接收时间前 360 秒至后 60 秒内，容纳五分钟补发和有限时钟偏差。重复或早于最新报告的记录被幂等忽略，不刷新在线状态。时钟偏差超出窗口会拒绝报告，应先检查主机时钟。
 
-上述时间检查并不是带持久 nonce 的密码学防重放协议。持有有效 token 的被入侵 agent 能在自己身份范围内提交虚假指标、占用自己的预算；server 重启后内存去重状态不保留。TLS、独立 token、权限隔离和及时吊销共同减少影响，不能保证任何攻击下都不可滥用。
+上述时间检查不是带持久 nonce 的密码学防重放协议。最新报告时间戳现随主机记录保存在 SQLite，重复报告在 server 重启后仍不能更新在线状态；持有有效 token 的被入侵 agent 仍能提交带新时间戳的虚假指标。TLS、独立 token、权限隔离和及时吊销共同减少影响，不能保证任何攻击下都不可滥用。数据库及 WAL 只允许 server 账号访问，凭据继续保留在独立受限文件中。
 
 ## 验证
 

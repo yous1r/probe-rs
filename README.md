@@ -6,7 +6,7 @@ Rust-based fleet probe. The first development slice targets milestone M1: host t
 
 - `crates/common`: versioned JSON protocol and shared data structures.
 - `crates/agent`: small synchronous agent using `/proc`, cgroup, and OpenVZ counters.
-- `crates/server`: Tokio/Axum ingest server, live in-memory state, SSE dashboard, and group APIs.
+- `crates/server`: Tokio/Axum ingest, a SQLite registry and latest reports, an in-memory dashboard cache, SSE, and group APIs.
 
 ## Development run
 
@@ -15,6 +15,7 @@ Configure the server with a 0600 agent credential file (one `id=token` per line)
 ```sh
 RPROBE_AGENT_TOKENS_FILE=/etc/rprobe/agents.tokens \
 RPROBE_ADMIN_TOKEN_FILE=/etc/rprobe/admin.token \
+RPROBE_DB_PATH=/var/lib/rprobe/rprobe.sqlite \
 cargo run -p rprobe-server
 ```
 
@@ -36,7 +37,11 @@ Open `/` and enter the administrator token to load the dashboard. All dashboard 
 
 ## M1 boundaries
 
-The current slice keeps latest host state and groups in memory; restarting the server clears them. Historical storage/downsampling, alert delivery, active probes, advanced asset/renewal management, and persistent configuration are later milestones. Authentication is required for dashboard data and group changes. TLS termination, durable secrets, and network exposure controls belong in the deployment layer.
+Registered hosts, groups, manual assignments, latest accepted reports and their receive times are persisted in a local SQLite file (WAL, synchronous FULL). Each successful write commits before the cache is updated. Restarting restores these records; hosts remain offline until a new report is accepted. Credential files remain the authority for agent access. Database failure stops startup or returns a write error; it never silently falls back to memory. Historical time series/downsampling, alerts, active probes and asset/renewal management remain later milestones.
+
+Set `RPROBE_DB_PATH` explicitly for services; the development default is `./rprobe.sqlite`. Use a durable directory owned by the server account, mode 0700, and database files mode 0600. On systemd, `StateDirectory=rprobe`, `StateDirectoryMode=0700` and `RPROBE_DB_PATH=/var/lib/rprobe/rprobe.sqlite` keep the database writable under `ProtectSystem=strict`. For backups, stop the server and copy the database plus any `-wal`/`-shm` sidecars together, or use the SQLite backup API. A copy of only the main file while WAL writes are active is not a valid backup procedure.
+
+`scripts/verify_persistence.py` starts the prebuilt server, creates registered hosts/groups, forces SIGKILL, restarts against the same database and verifies restoration without an agent reconnect. It also tests explicit ungrouping, duplicate-report liveness, and rejection of corrupt/volatile database paths. CI runs this alongside the security checks.
 
 ## GitHub CI and Linux validation
 

@@ -1,4 +1,5 @@
 use crate::security::Controls;
+use crate::storage::{LoadedState, Storage};
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::password_hash::{PasswordHash, SaltString};
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
@@ -7,10 +8,11 @@ use rand_core::OsRng;
 use rprobe_common::secret::{read_secret_file, valid_token};
 use rprobe_common::{AgentHello, ClientMessage, Group, HostSnapshot, MetricsReport};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 
 const MAX_GROUPS: usize = 500;
 const MAX_AGENTS: usize = 1000;
@@ -28,6 +30,8 @@ struct Inner {
     report_interval_secs: u64,
     events: broadcast::Sender<()>,
     controls: Controls,
+    storage: Storage,
+    mutations: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -36,12 +40,74 @@ struct ServerData {
     groups: BTreeMap<String, Group>,
 }
 
+#[derive(Clone)]
 struct HostRecord {
     hello: AgentHello,
     report: Option<MetricsReport>,
     last_seen_at: i64,
     group_id: Option<String>,
     clock_skew_secs: Option<i64>,
+    received_in_session: bool,
+}
+
+impl HostRecord {
+    fn snapshot(&self, now: i64, offline_after_secs: u64) -> HostSnapshot {
+        HostSnapshot {
+            hello: self.hello.clone(),
+            report: self.report.clone(),
+            last_seen_at: self.last_seen_at,
+            group_id: self.group_id.clone(),
+            clock_skew_secs: self.clock_skew_secs,
+            online: self.received_in_session
+                && now.saturating_sub(self.last_seen_at) <= offline_after_secs as i64,
+        }
+    }
+}
+
+impl ServerData {
+    fn restore(saved: LoadedState) -> Result<Self> {
+        let groups: BTreeMap<_, _> = saved
+            .groups
+            .into_iter()
+            .map(|g| (g.id.clone(), g))
+            .collect();
+        for group in groups.values() {
+            if !bounded_text(&group.id, 64, false)
+                || !bounded_text(&group.name, 100, false)
+                || group.parent_id.as_ref().is_some_and(|parent| {
+                    parent == &group.id
+                        || !groups.get(parent).is_some_and(|g| g.parent_id.is_none())
+                })
+            {
+                bail!("invalid saved group; refusing to start with an inconsistent registry");
+            }
+        }
+        let mut hosts = HashMap::new();
+        for host in saved.hosts {
+            if !valid_agent_id(&host.hello.agent_id)
+                || !valid_hello(&host.hello)
+                || host.report.as_ref().is_some_and(|r| !valid_report(r))
+                || host
+                    .group_id
+                    .as_ref()
+                    .is_some_and(|id| !groups.contains_key(id))
+            {
+                bail!("invalid saved host; refusing to discard existing records");
+            }
+            hosts.insert(
+                host.hello.agent_id.clone(),
+                HostRecord {
+                    hello: host.hello,
+                    report: host.report,
+                    last_seen_at: host.last_seen_at,
+                    group_id: host.group_id,
+                    clock_skew_secs: host.clock_skew_secs,
+                    received_in_session: false,
+                },
+            );
+        }
+        Ok(Self { hosts, groups })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,22 +116,33 @@ pub enum IngestError {
     UnknownHost,
     InvalidGroup,
     RateLimited,
+    StorageUnavailable,
 }
 
 impl AppState {
-    pub fn from_env() -> Result<Self> {
+    pub async fn from_env() -> Result<Self> {
         let credentials = credential_setting("RPROBE_AGENT_TOKENS", 400_000)?;
         let admin = credential_setting("RPROBE_ADMIN_TOKEN", 1024)?;
         let offline = env_u64("RPROBE_OFFLINE_AFTER_SECS", 30)?;
         let interval = env_u64("RPROBE_REPORT_INTERVAL_SECS", 5)?;
-        Self::new(&credentials, admin.trim().to_owned(), offline, interval)
+        let path = std::env::var("RPROBE_DB_PATH").unwrap_or_else(|_| "rprobe.sqlite".to_owned());
+        let storage = Storage::open(Path::new(&path)).await?;
+        Self::new(
+            &credentials,
+            admin.trim().to_owned(),
+            offline,
+            interval,
+            storage,
+        )
+        .await
     }
 
-    pub(crate) fn new(
+    pub(crate) async fn new(
         credentials: &str,
         admin_token: String,
         offline: u64,
         interval: u64,
+        storage: Storage,
     ) -> Result<Self> {
         if !valid_token(&admin_token) {
             bail!("admin token must contain 16-256 visible ASCII characters");
@@ -104,17 +181,47 @@ impl AppState {
         if agent_hashes.is_empty() {
             bail!("configure at least one agent credential");
         }
+        let data = ServerData::restore(storage.load().await?)?;
         let controls = Controls::new(agent_hashes.keys().cloned());
         let (events, _) = broadcast::channel(256);
         Ok(Self(Arc::new(Inner {
-            data: RwLock::new(ServerData::default()),
+            data: RwLock::new(data),
             agent_hashes,
             admin_token,
             offline_after_secs: offline,
             report_interval_secs: interval,
             events,
             controls,
+            storage,
+            mutations: Arc::new(Semaphore::new(64)),
         })))
+    }
+
+    // Once admitted, a write completes commit + cache publication even if its HTTP/WS caller leaves.
+    async fn mutate<F>(
+        &self,
+        operation: impl FnOnce(Self) -> F + Send + 'static,
+    ) -> Result<(), IngestError>
+    where
+        F: Future<Output = Result<(), IngestError>> + Send + 'static,
+    {
+        let permit = self
+            .0
+            .mutations
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| IngestError::RateLimited)?;
+        let state = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            operation(state).await
+        })
+        .await
+        .map_err(|_| IngestError::StorageUnavailable)?
+    }
+
+    pub async fn close(&self) {
+        self.0.storage.close().await;
     }
 
     pub fn controls(&self) -> &Controls {
@@ -174,6 +281,19 @@ impl AppState {
         message: ClientMessage,
         received_at: i64,
     ) -> Result<(), IngestError> {
+        let id = agent_id.to_owned();
+        self.mutate(
+            move |state| async move { state.ingest_committed(&id, message, received_at).await },
+        )
+        .await
+    }
+
+    async fn ingest_committed(
+        &self,
+        agent_id: &str,
+        message: ClientMessage,
+        received_at: i64,
+    ) -> Result<(), IngestError> {
         if !self.0.agent_hashes.contains_key(agent_id) {
             return Err(IngestError::UnknownHost);
         }
@@ -186,10 +306,15 @@ impl AppState {
                 self.controls()
                     .hello(agent_id)
                     .map_err(|_| IngestError::RateLimited)?;
-                if let Some(host) = data.hosts.get_mut(agent_id) {
-                    // Preserve manual assignment, including an explicit move to 'ungrouped'.
-                    host.hello = hello;
+                let mut new_group = None;
+                let updated = if let Some(host) = data.hosts.get(agent_id) {
+                    let mut updated = host.clone();
+                    updated.hello = hello;
+                    updated
                 } else {
+                    if data.hosts.len() >= MAX_AGENTS {
+                        return Err(IngestError::RateLimited);
+                    }
                     let group_id = hello
                         .group
                         .as_deref()
@@ -201,29 +326,36 @@ impl AppState {
                             if data.groups.len() >= MAX_GROUPS {
                                 return Err(IngestError::InvalidGroup);
                             }
-                            data.groups.insert(
-                                id.clone(),
-                                Group {
-                                    id: id.clone(),
-                                    name: id.clone(),
-                                    parent_id: None,
-                                    sort: 0,
-                                    color: None,
-                                },
-                            );
+                            new_group = Some(Group {
+                                id: id.clone(),
+                                name: id.clone(),
+                                parent_id: None,
+                                sort: 0,
+                                color: None,
+                            });
                         }
                     }
-                    data.hosts.insert(
-                        agent_id.to_owned(),
-                        HostRecord {
-                            hello,
-                            report: None,
-                            last_seen_at: received_at,
-                            group_id,
-                            clock_skew_secs: None,
-                        },
-                    );
+                    HostRecord {
+                        hello,
+                        report: None,
+                        last_seen_at: received_at,
+                        group_id,
+                        clock_skew_secs: None,
+                        received_in_session: false,
+                    }
+                };
+                self.0
+                    .storage
+                    .save_host(
+                        &updated.snapshot(received_at, self.0.offline_after_secs),
+                        new_group.as_ref(),
+                    )
+                    .await
+                    .map_err(storage_error)?;
+                if let Some(group) = new_group {
+                    data.groups.insert(group.id.clone(), group);
                 }
+                data.hosts.insert(agent_id.to_owned(), updated);
             }
             ClientMessage::Report { report } => {
                 if !valid_report(&report)
@@ -232,21 +364,28 @@ impl AppState {
                 {
                     return Err(IngestError::InvalidMessage);
                 }
-                let host = data
-                    .hosts
-                    .get_mut(agent_id)
-                    .ok_or(IngestError::UnknownHost)?;
+                let host = data.hosts.get(agent_id).ok_or(IngestError::UnknownHost)?;
                 if host
                     .report
                     .as_ref()
                     .is_some_and(|current| report.collected_at <= current.collected_at)
                 {
-                    // HTTP-delivered records may be replayed over WS; idempotent, without extending liveness.
-                    return Ok(());
+                    return Ok(()); // Durable high-water timestamp prevents duplicate liveness after restart too.
                 }
-                host.clock_skew_secs = Some(received_at.saturating_sub(report.collected_at));
-                host.report = Some(report);
-                host.last_seen_at = received_at;
+                let mut updated = host.clone();
+                updated.clock_skew_secs = Some(received_at.saturating_sub(report.collected_at));
+                updated.report = Some(report);
+                updated.last_seen_at = received_at;
+                updated.received_in_session = true;
+                self.0
+                    .storage
+                    .save_host(
+                        &updated.snapshot(received_at, self.0.offline_after_secs),
+                        None,
+                    )
+                    .await
+                    .map_err(storage_error)?;
+                data.hosts.insert(agent_id.to_owned(), updated);
             }
         }
         drop(data);
@@ -259,20 +398,18 @@ impl AppState {
         let mut hosts: Vec<_> = data
             .hosts
             .values()
-            .map(|host| HostSnapshot {
-                hello: host.hello.clone(),
-                report: host.report.clone(),
-                last_seen_at: host.last_seen_at,
-                online: now.saturating_sub(host.last_seen_at) <= self.0.offline_after_secs as i64,
-                group_id: host.group_id.clone(),
-                clock_skew_secs: host.clock_skew_secs,
-            })
+            .map(|host| host.snapshot(now, self.0.offline_after_secs))
             .collect();
         hosts.sort_by(|a, b| a.hello.hostname.cmp(&b.hello.hostname));
         (hosts, data.groups.values().cloned().collect())
     }
 
     pub async fn create_group(&self, group: Group) -> Result<(), IngestError> {
+        self.mutate(move |state| async move { state.create_group_committed(group).await })
+            .await
+    }
+
+    async fn create_group_committed(&self, group: Group) -> Result<(), IngestError> {
         if !bounded_text(&group.id, 64, false)
             || !bounded_text(&group.name, 100, false)
             || group
@@ -296,6 +433,11 @@ impl AppState {
                 return Err(IngestError::InvalidGroup);
             }
         }
+        self.0
+            .storage
+            .create_group(&group)
+            .await
+            .map_err(storage_error)?;
         data.groups.insert(group.id.clone(), group);
         drop(data);
         let _ = self.0.events.send(());
@@ -307,6 +449,16 @@ impl AppState {
         agent_id: &str,
         group_id: Option<String>,
     ) -> Result<(), IngestError> {
+        let id = agent_id.to_owned();
+        self.mutate(move |state| async move { state.assign_group_committed(&id, group_id).await })
+            .await
+    }
+
+    async fn assign_group_committed(
+        &self,
+        agent_id: &str,
+        group_id: Option<String>,
+    ) -> Result<(), IngestError> {
         let mut data = self.0.data.write().await;
         if group_id
             .as_ref()
@@ -314,14 +466,25 @@ impl AppState {
         {
             return Err(IngestError::InvalidGroup);
         }
-        data.hosts
+        let host = data
+            .hosts
             .get_mut(agent_id)
-            .ok_or(IngestError::UnknownHost)?
-            .group_id = group_id;
+            .ok_or(IngestError::UnknownHost)?;
+        self.0
+            .storage
+            .assign_group(agent_id, group_id.as_deref())
+            .await
+            .map_err(storage_error)?;
+        host.group_id = group_id;
         drop(data);
         let _ = self.0.events.send(());
         Ok(())
     }
+}
+
+fn storage_error(error: anyhow::Error) -> IngestError {
+    tracing::error!(%error, "failed to persist registry update");
+    IngestError::StorageUnavailable
 }
 
 fn credential_setting(name: &str, max_bytes: u64) -> Result<String> {
@@ -413,13 +576,15 @@ pub fn unix_time_secs() -> i64 {
 }
 
 #[cfg(test)]
-pub(crate) fn test_state() -> AppState {
+pub(crate) async fn test_state() -> AppState {
     AppState::new(
         "node-a=test-agent-credential-12345,node-b=other-agent-credential-12345",
         "test-admin-credential-12345".to_owned(),
         30,
         5,
+        Storage::for_test().await,
     )
+    .await
     .unwrap()
 }
 
@@ -478,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn identity_replay_time_window_and_groups_are_bounded() {
-        let state = test_state();
+        let state = test_state().await;
         assert_eq!(
             state.ingest("node-b", test_hello(), 1000).await,
             Err(IngestError::InvalidMessage)
@@ -542,7 +707,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_or_cross_agent_credentials() {
-        let state = test_state();
+        let state = test_state().await;
         assert!(state
             .authorize_agent("node-a", "test-agent-credential-12345")
             .await
@@ -558,8 +723,14 @@ mod tests {
             "a=test-admin-credential-12345",
             "test-admin-credential-12345".to_owned(),
             30,
-            5
+            5,
+            Storage::for_test().await,
         )
+        .await
         .is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "state_persistence_tests.rs"]
+mod persistence_tests;

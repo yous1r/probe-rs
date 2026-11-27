@@ -282,6 +282,7 @@ fn ingest_status(error: IngestError) -> StatusCode {
     match error {
         IngestError::UnknownHost => StatusCode::CONFLICT,
         IngestError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        IngestError::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         IngestError::InvalidMessage | IngestError::InvalidGroup => StatusCode::BAD_REQUEST,
     }
 }
@@ -332,7 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_routes_require_admin_and_auth_precedes_json() {
-        let app = router(test_state());
+        let app = router(test_state().await);
         for path in ["/api/overview", "/api/groups", "/api/events"] {
             assert_eq!(
                 app.clone()
@@ -377,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_large_bodies_cross_agent_ids_and_browser_agent_origins() {
-        let state = test_state();
+        let state = test_state().await;
         let app = router(state.clone());
         let response = app
             .clone()

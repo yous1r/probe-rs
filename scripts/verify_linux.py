@@ -479,6 +479,7 @@ class OwnedProcesses:
                 "RPROBE_ADMIN_TOKEN": admin_token,
                 "RPROBE_OFFLINE_AFTER_SECS": "3",
                 "RPROBE_REPORT_INTERVAL_SECS": "1",
+                "RPROBE_DB_PATH": str(self.agent_token_file.with_suffix('.sqlite').resolve()),
             }
         )
         return self.spawn("verify-linux-server", binary, [], env)

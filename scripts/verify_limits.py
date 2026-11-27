@@ -36,6 +36,7 @@ def main():
     base_url = f'http://127.0.0.1:{port}'
     env = {**os.environ, 'RPROBE_LISTEN': f'127.0.0.1:{port}',
            'RPROBE_AGENT_TOKENS': f'limited={token}', 'RPROBE_ADMIN_TOKEN': admin}
+    env['RPROBE_DB_PATH'] = str(token_file.with_suffix('.sqlite'))
     server = agent = None
     result = {'status': 'FAIL', 'build_performed': False,
               'expected_memory_limit_bytes': 268435456, 'expected_cpu_limit_cores': 0.1,

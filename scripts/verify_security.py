@@ -130,6 +130,7 @@ def main():
         env = {k: v for k, v in os.environ.items() if not k.startswith('RPROBE_')}
         env.update(RPROBE_LISTEN=f'127.0.0.1:{server_port}', RPROBE_AGENT_TOKENS_FILE=str(tokens_path),
                    RPROBE_ADMIN_TOKEN_FILE=str(admin_path), RPROBE_OFFLINE_AFTER_SECS='2')
+        env['RPROBE_DB_PATH'] = str(credential_dir / 'registry.sqlite')
         try:
             with (args.output_dir / 'server.log').open('w') as log:
                 server = subprocess.Popen([str(server_bin)], env=env, stdout=log, stderr=log)
