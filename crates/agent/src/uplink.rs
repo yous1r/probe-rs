@@ -88,7 +88,7 @@ pub fn run(config: AgentConfig) -> Result<()> {
                         Ok(()) => {
                             pending.pop_front();
                         }
-                        Err(ureq::Error::Status(409, _)) => {
+                        Err(409) => {
                             http_hello_sent = false;
                             break;
                         }
@@ -224,14 +224,19 @@ fn post_message(
     http: &ureq::Agent,
     config: &AgentConfig,
     message: &ClientMessage,
-) -> Result<(), ureq::Error> {
+) -> Result<(), u16> {
+    let body = serde_json::to_value(message).map_err(|_| 0_u16)?;
     let response = http
         .post(&format!("{}/api/report", config.server))
         .set("Authorization", &format!("Bearer {}", config.token))
         .set("X-Agent-Id", &config.agent_id)
-        .send_json(serde_json::to_value(message).expect("finite protocol data"))?;
+        .send_json(body)
+        .map_err(|error| match error {
+            ureq::Error::Status(code, _) => code,
+            ureq::Error::Transport(_) => 0,
+        })?;
     if !(200..300).contains(&response.status()) {
-        return Err(ureq::Error::Status(response.status(), response));
+        return Err(response.status());
     }
     Ok(())
 }
