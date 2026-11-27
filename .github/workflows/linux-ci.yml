@@ -35,23 +35,40 @@ jobs:
         run: cargo test --locked --workspace --target "$TARGET"
       - name: Build release binaries
         run: cargo build --locked --release --workspace --target "$TARGET"
-      - name: Package traceable artifacts
+      - name: Package agent and server separately
         run: |
-          mkdir -p dist
-          cp "target/$TARGET/release/rprobe-agent" "target/$TARGET/release/rprobe-server" dist/
-          printf '%s\n' "$GITHUB_SHA" > dist/COMMIT
-          rustc -vV > dist/TOOLCHAIN.txt
-          file dist/rprobe-agent dist/rprobe-server | tee dist/BINARIES.txt
-          if readelf -l dist/rprobe-agent dist/rprobe-server | grep -q INTERP; then
-            echo 'Expected static binaries without a dynamic interpreter' >&2
-            exit 1
-          fi
-          cd dist
-          sha256sum rprobe-agent rprobe-server COMMIT TOOLCHAIN.txt BINARIES.txt > SHA256SUMS
-          tar -czf "../rprobe-$TARGET.tar.gz" rprobe-agent rprobe-server COMMIT TOOLCHAIN.txt BINARIES.txt SHA256SUMS
-      - uses: actions/upload-artifact@v4
+          for component in rprobe-agent rprobe-server; do
+            package_dir="dist/$component"
+            mkdir -p "$package_dir"
+            cp "target/$TARGET/release/$component" "$package_dir/"
+            printf '%s\n' "$GITHUB_SHA" > "$package_dir/COMMIT"
+            rustc -vV > "$package_dir/TOOLCHAIN.txt"
+            readelf -l "$package_dir/$component" > "$RUNNER_TEMP/$component-elf.txt"
+            if grep -q INTERP "$RUNNER_TEMP/$component-elf.txt"; then
+              echo "Expected $component to be static without a dynamic interpreter" >&2
+              exit 1
+            fi
+            (
+              cd "$package_dir"
+              file "$component" | tee BINARIES.txt
+              sha256sum "$component" COMMIT TOOLCHAIN.txt BINARIES.txt > SHA256SUMS
+            )
+            tar -C "$package_dir" -czf "$component-$TARGET.tar.gz" \
+              "$component" COMMIT TOOLCHAIN.txt BINARIES.txt SHA256SUMS
+          done
+      - name: Upload agent package
+        uses: actions/upload-artifact@v4
         with:
-          name: rprobe-x86_64-unknown-linux-musl
-          path: rprobe-x86_64-unknown-linux-musl.tar.gz
+          name: rprobe-agent-${{ env.TARGET }}
+          path: rprobe-agent-${{ env.TARGET }}.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload server package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rprobe-server-${{ env.TARGET }}
+          path: rprobe-server-${{ env.TARGET }}.tar.gz
+          compression-level: 0
           if-no-files-found: error
           retention-days: 14

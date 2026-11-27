@@ -38,9 +38,16 @@ The current slice keeps latest host state and groups in memory; restarting the s
 
 ## GitHub CI and Linux validation
 
-Linux binaries are built on [GitHub Actions](https://github.com/yous1r/probe-rs/actions/workflows/linux-ci.yml), not on the validation VPS. Each run checks formatting, Clippy, and unit tests on `x86_64-unknown-linux-musl`, then uploads a release archive containing both static binaries, `COMMIT`, build information, and `SHA256SUMS`.
+Linux binaries are built on [GitHub Actions](https://github.com/yous1r/probe-rs/actions/workflows/linux-ci.yml), not on the validation VPS. Each run checks formatting, Clippy, and unit tests on `x86_64-unknown-linux-musl`, then uploads two independently downloadable artifacts:
 
-Download the artifact for the intended commit and unpack it on the test host. Verify `sha256sum -c SHA256SUMS` and `COMMIT` before running. With Python 3.10+ and the repository's scripts available:
+| Actions artifact | Archive | Executable |
+| --- | --- | --- |
+| `rprobe-agent-x86_64-unknown-linux-musl` | `rprobe-agent-x86_64-unknown-linux-musl.tar.gz` | `rprobe-agent` |
+| `rprobe-server-x86_64-unknown-linux-musl` | `rprobe-server-x86_64-unknown-linux-musl.tar.gz` | `rprobe-server` |
+
+Each archive contains only its own static executable, plus `COMMIT`, `TOOLCHAIN.txt`, `BINARIES.txt`, and `SHA256SUMS`. Download the required artifact from the intended workflow run; GitHub wraps the `.tar.gz` in an artifact ZIP. Extract the ZIP, then unpack the `.tar.gz` into its own directory and run `sha256sum -c SHA256SUMS` there. Confirm that `COMMIT` matches the intended revision before running.
+
+For the joint validation scripts below, download both packages from the same run and verify them in separate directories so their metadata does not overwrite each other. Copy the two executables into one directory, such as `/path/to/artifact`, and pass that directory as `--bin-dir`. Python 3.10+ and the repository's scripts are required:
 
 ```sh
 python3 scripts/verify_linux.py --bin-dir /path/to/artifact --output-dir /tmp/rprobe-check \
