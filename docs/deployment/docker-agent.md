@@ -18,12 +18,12 @@
 | `RPROBE_CGROUP_SCOPE` | 默认 `process`，按容器/进程所在 cgroup 采集 |
 | `RPROBE_AGENT_URL` | 可选，固定版本的 HTTPS 下载地址，必须与下项一起设置 |
 | `RPROBE_AGENT_SHA256` | 上项下载包中 **agent 二进制** 的 SHA-256，64 位小写 hex，不是压缩包校验和 |
-| `RPROBE_AGENT_FORMAT` | `zip`（默认，Actions artifact）、`tar.gz` 或 `binary` |
+| `RPROBE_AGENT_FORMAT` | `tar.gz`（默认）、`zip`（Actions artifact）或 `binary` |
 | `RPROBE_RUNTIME_DIR` | token 私有副本的 tmpfs 根目录，默认 `/dev/shm` |
 
 每个容器实例需要独立 ID/token，并先在 server 的接入清单中配置。脚本不会以管理员身份注册新凭据；共享同一 ID 的多副本会触发 server 的单连接限制。
 
-默认 amd64 来源固定在 GitHub CI run `45958389504`，提交 `a38f4350c09706194271daf286cab2dfef1cf60f`，二进制 SHA-256 固定为 `0f04bc74887ca4b7aae5b63d989b06466e15b1d1834604352561e0cf2dcd30cc`。**Actions artifact 只保留 14 天**；有效缓存不受影响，但过期后无法首次下载。长期运行请将已校验的独立包放到自己的稳定 HTTPS 下载地址，并配置 URL、二进制 SHA-256、格式，或在镜像构建时预置相同哈希的 agent。脚本不追踪可变的 latest。
+默认 amd64 下载源是固定 GitHub Release `agent-bootstrap-v0.1.0` 的独立 agent 包，二进制 SHA-256 固定为 `0f04bc74887ca4b7aae5b63d989b06466e15b1d1834604352561e0cf2dcd30cc`。该 Release 由通过完整检查的 GitHub CI 发布，不受 Actions artifact 的 14 天保留期影响。也可以将已校验的包放到自己的稳定 HTTPS 地址，并同时配置 URL、二进制 SHA-256、格式，或在镜像构建时预置相同哈希的 agent。脚本不追踪可变的 latest。
 
 目前仓库仅发布 x86_64 musl 产物。arm64 需要提供匹配架构的 URL 和哈希；未提供时跳过 agent。其他架构同样跳过，主程序继续。
 
@@ -85,7 +85,7 @@ exec /path/to/original-daemon --foreground
 
 ```sh
 # 日志
- docker logs my-app
+docker logs my-app
 # 本地或 CI 的 Docker 回归：agent-binary 必须是已构建的 Linux agent
 python3 scripts/verify_container_entrypoint.py \
   --agent-binary target/x86_64-unknown-linux-musl/release/rprobe-agent \

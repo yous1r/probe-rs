@@ -90,3 +90,28 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 14
+
+  publish-container-agent:
+    needs: linux-musl
+    if: github.event_name == 'push' && github.ref == 'refs/tags/agent-bootstrap-v0.1.0'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rprobe-agent-x86_64-unknown-linux-musl
+      - name: Publish fixed agent download after all checks pass
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          archive=rprobe-agent-x86_64-unknown-linux-musl.tar.gz
+          mkdir verified
+          tar -xzf "$archive" -C verified
+          (cd verified && sha256sum -c SHA256SUMS)
+          test "$(sha256sum verified/rprobe-agent | cut -d ' ' -f1)" = 0f04bc74887ca4b7aae5b63d989b06466e15b1d1834604352561e0cf2dcd30cc
+          printf '%s\n' 'Fixed amd64 musl agent for the optional container startup script. Built and tested by GitHub CI; includes commit metadata and SHA256SUMS.' > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$RELEASE_TAG" "$archive" --verify-tag --title 'Container agent bootstrap v0.1.0' --notes-file "$RUNNER_TEMP/release-notes.md"

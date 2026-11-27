@@ -96,8 +96,8 @@ rprobe_worker() (
         rprobe_url=$RPROBE_AGENT_URL
         rprobe_sha256=$RPROBE_AGENT_SHA256
     elif [ "$rprobe_target" = x86_64-unknown-linux-musl ]; then
-        # CI commit a38f4350c09706194271daf286cab2dfef1cf60f. Artifact retention is 14 days.
-        rprobe_url=https://nightly.link/yous1r/probe-rs/actions/runs/45958389504/rprobe-agent-x86_64-unknown-linux-musl.zip
+        # Fixed GitHub Release; binary hash is pinned independently of the download server.
+        rprobe_url=https://github.com/yous1r/probe-rs/releases/download/agent-bootstrap-v0.1.0/rprobe-agent-x86_64-unknown-linux-musl.tar.gz
         rprobe_sha256=0f04bc74887ca4b7aae5b63d989b06466e15b1d1834604352561e0cf2dcd30cc
     else
         rprobe_log 'no bundled arm64 release; provide its HTTPS URL and binary SHA-256'; exit 0
@@ -105,7 +105,7 @@ rprobe_worker() (
     case "$rprobe_url" in https://*) ;; *) rprobe_log 'download URL must use HTTPS'; exit 0 ;; esac
     case "$rprobe_sha256" in *[!0-9a-f]*|'') rprobe_log 'binary SHA-256 must be lowercase hex'; exit 0 ;; esac
     [ "${#rprobe_sha256}" -eq 64 ] || { rprobe_log 'binary SHA-256 must have 64 characters'; exit 0; }
-    rprobe_format=${RPROBE_AGENT_FORMAT:-zip}
+    rprobe_format=${RPROBE_AGENT_FORMAT:-tar.gz}
     rprobe_dir=${RPROBE_AGENT_DIR:-/tmp/rprobe-agent-$(id -u)}
     case "$rprobe_dir" in /*) ;; *) rprobe_log 'RPROBE_AGENT_DIR must be an absolute path'; exit 0 ;; esac
     [ ! -L "$rprobe_dir" ] || { rprobe_log 'refusing symlink agent directory'; exit 0; }
