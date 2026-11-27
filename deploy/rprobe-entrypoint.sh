@@ -6,6 +6,11 @@ rprobe_log() {
     printf '%s\n' "rprobe-bootstrap: $*" >&2
 }
 
+rprobe_owner_alive() {
+    # PID 1 may belong to Docker's root-owned init, which a non-root agent cannot signal.
+    if [ "$rprobe_owner" = 1 ]; then [ -d /proc/1 ]; else kill -0 "$rprobe_owner" 2>/dev/null; fi
+}
+
 rprobe_verified() {
     [ -f "$rprobe_binary" ] && [ ! -L "$rprobe_binary" ] && [ -x "$rprobe_binary" ] || return 1
     rprobe_actual=$(sha256sum "$rprobe_binary" 2>/dev/null) || return 1
@@ -121,7 +126,7 @@ rprobe_worker() (
     [ ! -L "$rprobe_dir/agent.lock" ] || exit 0
     exec 9>"$rprobe_dir/agent.lock"
     flock -n 9 || exit 0 # Kernel-held lock, no stale PID file; shared by all starts in this directory.
-    kill -0 "$rprobe_owner" 2>/dev/null || exit 0
+    rprobe_owner_alive || exit 0
 
     # Docker secrets are commonly mounted 0444. Copy, don't chmod the mounted source.
     [ -f "$RPROBE_TOKEN_FILE" ] && [ -r "$RPROBE_TOKEN_FILE" ] || {
@@ -142,16 +147,16 @@ rprobe_worker() (
     RPROBE_CGROUP_SCOPE=${RPROBE_CGROUP_SCOPE:-process}
     export RPROBE_CGROUP_SCOPE
 
-    while kill -0 "$rprobe_owner" 2>/dev/null; do
+    while rprobe_owner_alive; do
         if rprobe_verified || rprobe_install; then
-            kill -0 "$rprobe_owner" 2>/dev/null || exit 0
+            rprobe_owner_alive || exit 0
             set -- "$rprobe_binary" --server "$RPROBE_SERVER" --id "$RPROBE_AGENT_ID" \
                 --token-file "$rprobe_runtime/token" --interval "${RPROBE_INTERVAL:-5}"
             if [ -n "${RPROBE_GROUP:-}" ]; then set -- "$@" --group "$RPROBE_GROUP"; fi
             "$@" </dev/null &
             rprobe_child=$!
-            while kill -0 "$rprobe_owner" 2>/dev/null && kill -0 "$rprobe_child" 2>/dev/null; do sleep 2; done
-            kill -0 "$rprobe_owner" 2>/dev/null || exit 0
+            while rprobe_owner_alive && kill -0 "$rprobe_child" 2>/dev/null; do sleep 2; done
+            rprobe_owner_alive || exit 0
             if wait "$rprobe_child"; then rprobe_status=0; else rprobe_status=$?; fi
             rprobe_child=
             rprobe_log "agent exited (status $rprobe_status); retrying in 60 seconds"
@@ -159,7 +164,7 @@ rprobe_worker() (
             rprobe_log 'agent installation unavailable; retrying in 60 seconds'
         fi
         rprobe_ticks=0
-        while [ "$rprobe_ticks" -lt 30 ] && kill -0 "$rprobe_owner" 2>/dev/null; do
+        while [ "$rprobe_ticks" -lt 30 ] && rprobe_owner_alive; do
             sleep 2
             rprobe_ticks=$((rprobe_ticks + 1))
         done

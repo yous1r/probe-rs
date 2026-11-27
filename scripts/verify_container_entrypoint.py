@@ -48,7 +48,7 @@ while True: time.sleep(.1)
 APPLICATION = '''#!/usr/local/bin/python3
 import json,os,pathlib,signal,sys,time
 state=pathlib.Path('/state')
-(state/'app.json').write_text(json.dumps({'pid':os.getpid(),'args':sys.argv[1:]}))
+(state/'app.json').write_text(json.dumps({'pid':os.getpid(),'ppid':os.getppid(),'args':sys.argv[1:]}))
 def stop(*_):
  (state/'term').write_text('received')
  sys.exit(37)
@@ -136,7 +136,7 @@ ENV PATH=/testbin:/usr/local/bin:/usr/bin:/bin
 ENTRYPOINT ["/bin/sh", "/rprobe-entrypoint.sh"]
 CMD ["python3", "/fixtures/app.py"]
 ''', encoding='utf-8')
-        def create(name, updates=None, app=None, cache=None, user=None, readonly=False, raw=False):
+        def create(name, updates=None, app=None, cache=None, user=None, readonly=False, raw=False, init=False):
             state = root / (name + '-state'); state.mkdir(); state.chmod(0o777)
             cache = cache or root / (name + '-cache')
             if not cache.exists(): cache.mkdir(mode=0o700)
@@ -153,6 +153,7 @@ CMD ["python3", "/fixtures/app.py"]
                        '-v', str(token) + ':/run/secrets/agent:ro']
             if user: command += ['--user', user]
             if raw: command += ['--entrypoint', '/bin/sh']
+            if init: command += ['--init']
             for key, value in env.items(): command += ['-e', key + '=' + value]
             command += [image] + (app or [])
             started = time.monotonic()
@@ -160,7 +161,7 @@ CMD ["python3", "/fixtures/app.py"]
             wait_for(lambda: (state / 'app.json').exists(), name + ': main app did not start promptly', 5)
             require(time.monotonic() - started < 5, 'startup stalled')
             app_info = json.loads((state / 'app.json').read_text())
-            require(app_info['pid'] == 1, 'main app is not PID 1; exec semantics lost')
+            require(app_info['ppid'] == 1 if init else app_info['pid'] == 1, 'main exec semantics lost')
             return container, state, cache, token
 
         def stop(container):
@@ -241,6 +242,10 @@ CMD ["python3", "/fixtures/app.py"]
             wait_for(lambda: (state / 'agent-started').exists(), 'existing-entrypoint integration failed')
             require(len((state / 'agents').read_text().splitlines()) == 1, 'start-only duplicated agent')
             stop(container); passed('existing_entrypoint_start_only_keeps_exec_and_singleton')
+
+            container, state, _, _ = create('nonroot-init', {}, ['-c', '/bin/sh /rprobe-entrypoint.sh --start-only; exec python3 /fixtures/app.py'], cache=nonroot_cache, user='65534:65534', raw=True, init=True)
+            wait_for(lambda: (state / 'agent-started').exists(), 'nonroot --start-only under --init failed')
+            stop(container); passed('nonroot_start_only_under_docker_init_preserves_start_and_stop')
 
             directory_cache = root / 'directory-target-cache'; directory_cache.mkdir(mode=0o700)
             (directory_cache / 'rprobe-agent').mkdir()
