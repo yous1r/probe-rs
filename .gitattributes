@@ -1,0 +1,2 @@
+deploy/rprobe-entrypoint.sh text eol=lf
+scripts/verify_container_entrypoint.py text eol=lf

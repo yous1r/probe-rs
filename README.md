@@ -77,3 +77,7 @@ The collection and transport design was compared with [ServerStatus-Rust](https:
 For an agent installed as a dedicated systemd service to monitor the whole VPS/container, set `RPROBE_CGROUP_SCOPE=mount` in that service. This reads counters and quotas at the mounted cgroup root instead of the agent service's child cgroup. The default `process` scope remains suitable for agents embedded in application containers. Use `mount` only when the mount root represents the machine/container you intend to monitor.
 
 The server holds an exclusive `.lock` file beside the SQLite file for its lifetime; only one server process may use a registry. Do not remove that lock file while the server is running. Unknown SQLite schemas or versions are rejected before changing journal mode.
+
+## Optional agent in an application container
+
+Use [deploy/rprobe-entrypoint.sh](deploy/rprobe-entrypoint.sh) to check/install the agent in the background while immediately `exec`-ing the original application. Supply `RPROBE_SERVER`, a distinct `RPROBE_AGENT_ID`, and a read-only `RPROBE_TOKEN_FILE`. Verified cached binaries are reused; installation or agent failure never gates the application's startup. See [Docker integration](docs/deployment/docker-agent.md) for ENTRYPOINT and `--start-only` examples, dependencies, cache permissions, and pinned download configuration. The bundled Actions download has a 14-day retention period; use a stable HTTPS mirror plus the binary SHA-256 for durable deployments.
