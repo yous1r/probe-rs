@@ -1,0 +1,41 @@
+[Unit]
+Description=rprobe agent for u2-vps
+Wants=network-online.target rprobe-server.service
+After=network-online.target rprobe-server.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=rprobe-agent
+Group=rprobe-agent
+Environment=RPROBE_CGROUP_SCOPE=mount
+ExecStart=/opt/rprobe/rprobe-agent --server http://127.0.0.1:8080 --id u2-vps --token-file /etc/rprobe-agent/agent.token --interval 5
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+UMask=0077
+LimitNOFILE=128
+MemoryMax=64M
+CPUQuota=10%
+TasksMax=16
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rprobe-agent
+
+[Install]
+WantedBy=multi-user.target
