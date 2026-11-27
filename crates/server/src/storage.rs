@@ -1,14 +1,17 @@
 //! The registry and latest accepted report are committed before publishing in-memory state.
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use rprobe_common::{AgentHello, Group, HostSnapshot};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
-use std::fs::{self, OpenOptions};
-use std::path::Path;
+use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub struct Storage {
     pool: SqlitePool,
+    lock: Mutex<Option<File>>,
 }
 
 pub struct LoadedState {
@@ -26,60 +29,88 @@ impl Storage {
         {
             bail!("RPROBE_DB_PATH must be a local file path; memory databases and database URLs are not allowed");
         }
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
+        prepare_file(&lock_path).context("prepare registry lock file")?;
+        let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+        lock.try_lock_exclusive()
+            .context("registry already in use; only one server may open a database")?;
         prepare_file(path).with_context(|| format!("prepare database {}", path.display()))?;
         Self::connect(
             SqliteConnectOptions::new()
                 .filename(path)
                 .create_if_missing(false),
+            Some(lock),
         )
         .await
     }
 
-    async fn connect(options: SqliteConnectOptions) -> Result<Self> {
+    async fn connect(options: SqliteConnectOptions, lock: Option<File>) -> Result<Self> {
+        let options = options
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5));
+        // Validate before requesting WAL, so a rejected foreign database remains unchanged.
+        let mut inspection = SqliteConnection::connect_with(&options)
+            .await
+            .context("inspect SQLite database")?;
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut inspection)
+            .await?;
+        match version {
+            0 => {
+                let objects: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
+                )
+                .fetch_one(&mut inspection)
+                .await?;
+                if objects != 0 {
+                    bail!("unrecognized nonempty database; refusing to replace its schema");
+                }
+            }
+            1 => {
+                sqlx::query("SELECT id, parent_id, name, sort, color FROM groups LIMIT 0")
+                    .fetch_all(&mut inspection)
+                    .await?;
+                sqlx::query("SELECT id, hello_json, report_json, last_seen_at, group_id, clock_skew_secs FROM hosts LIMIT 0")
+                    .fetch_all(&mut inspection).await?;
+            }
+            _ => bail!("unsupported database schema version {version}"),
+        }
+        let integrity: String = sqlx::query_scalar("PRAGMA quick_check")
+            .fetch_one(&mut inspection)
+            .await?;
+        if integrity != "ok" {
+            bail!("SQLite integrity check failed; restore a verified backup");
+        }
+        if sqlx::query("PRAGMA foreign_key_check")
+            .fetch_optional(&mut inspection)
+            .await?
+            .is_some()
+        {
+            bail!("SQLite foreign key check failed");
+        }
+        inspection.close().await?;
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(6))
             .connect_with(
                 options
-                    .foreign_keys(true)
                     .journal_mode(SqliteJournalMode::Wal)
-                    .synchronous(SqliteSynchronous::Full)
-                    .busy_timeout(Duration::from_secs(5)),
+                    .synchronous(SqliteSynchronous::Full),
             )
             .await
             .context("open SQLite database; no in-memory fallback is available")?;
-        let store = Self { pool };
-        let mut transaction = store.pool.begin().await?;
-        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&mut *transaction)
-            .await?;
-        match version {
-            0 => {
-                let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
-                    .fetch_one(&mut *transaction).await?;
-                if tables != 0 {
-                    bail!("unrecognized nonempty database; refusing to replace its schema");
-                }
-                sqlx::raw_sql(include_str!("../migrations/0001_registry.sql"))
-                    .execute(&mut *transaction)
-                    .await?;
-            }
-            1 => {}
-            _ => bail!("unsupported database schema version {version}"),
-        }
-        transaction.commit().await?;
-        let integrity: String = sqlx::query_scalar("PRAGMA quick_check")
-            .fetch_one(&store.pool)
-            .await?;
-        if integrity != "ok" {
-            bail!("SQLite integrity check failed; preserve database and restore a verified backup");
-        }
-        if sqlx::query("PRAGMA foreign_key_check")
-            .fetch_optional(&store.pool)
-            .await?
-            .is_some()
-        {
-            bail!("SQLite foreign key check failed");
+        let store = Self {
+            pool,
+            lock: Mutex::new(lock),
+        };
+        if version == 0 {
+            let mut transaction = store.pool.begin().await?;
+            sqlx::raw_sql(include_str!("../migrations/0001_registry.sql"))
+                .execute(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
         }
         Ok(store)
     }
@@ -177,11 +208,14 @@ impl Storage {
 
     pub async fn close(&self) {
         self.pool.close().await;
+        if let Ok(mut lock) = self.lock.lock() {
+            lock.take();
+        }
     }
 
     #[cfg(test)]
     pub async fn for_test() -> Self {
-        Self::connect(SqliteConnectOptions::new().in_memory(true))
+        Self::connect(SqliteConnectOptions::new().in_memory(true), None)
             .await
             .unwrap()
     }
@@ -270,5 +304,36 @@ mod tests {
         storage.close().await;
         assert!(Storage::open(&path).await.is_err());
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn second_server_is_rejected_and_rejected_foreign_databases_remain_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("registry.sqlite");
+        let owner = Storage::open(&path).await.unwrap();
+        assert!(Storage::open(&path).await.is_err());
+        owner.close().await;
+        Storage::open(&path).await.unwrap().close().await;
+
+        for (i, schema) in [
+            "CREATE TABLE sqliteData (value TEXT)",
+            "CREATE VIEW external_view AS SELECT 1",
+            "PRAGMA user_version = 99",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let foreign = temp.path().join(format!("foreign-{i}.sqlite"));
+            prepare_file(&foreign).unwrap();
+            let mut connection =
+                SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&foreign))
+                    .await
+                    .unwrap();
+            sqlx::query(schema).execute(&mut connection).await.unwrap();
+            connection.close().await.unwrap();
+            let original = fs::read(&foreign).unwrap();
+            assert!(Storage::open(&foreign).await.is_err());
+            assert_eq!(fs::read(&foreign).unwrap(), original);
+        }
     }
 }

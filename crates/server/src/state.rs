@@ -125,7 +125,11 @@ impl AppState {
         let admin = credential_setting("RPROBE_ADMIN_TOKEN", 1024)?;
         let offline = env_u64("RPROBE_OFFLINE_AFTER_SECS", 30)?;
         let interval = env_u64("RPROBE_REPORT_INTERVAL_SECS", 5)?;
-        let path = std::env::var("RPROBE_DB_PATH").unwrap_or_else(|_| "rprobe.sqlite".to_owned());
+        let path = match std::env::var("RPROBE_DB_PATH") {
+            Ok(path) => path,
+            Err(std::env::VarError::NotPresent) => "rprobe.sqlite".to_owned(),
+            Err(error) => return Err(error).context("RPROBE_DB_PATH must be valid UTF-8"),
+        };
         let storage = Storage::open(Path::new(&path)).await?;
         Self::new(
             &credentials,

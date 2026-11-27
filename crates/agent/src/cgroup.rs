@@ -36,15 +36,33 @@ struct Cgroups {
     cpuacct: Option<Hierarchy>,
 }
 
+pub fn validate_scope() -> anyhow::Result<()> {
+    match std::env::var("RPROBE_CGROUP_SCOPE") {
+        Ok(scope) if scope == "process" || scope == "mount" => Ok(()),
+        Err(std::env::VarError::NotPresent) => Ok(()),
+        _ => anyhow::bail!("RPROBE_CGROUP_SCOPE must be process or mount"),
+    }
+}
+
+fn selected_scope(hierarchy: Option<Hierarchy>, mount_scope: bool) -> Option<Hierarchy> {
+    hierarchy.map(|mut h| {
+        if mount_scope {
+            h.directory = h.mount.clone();
+        }
+        h
+    })
+}
+
 fn current() -> &'static Cgroups {
     static GROUPS: OnceLock<Cgroups> = OnceLock::new();
     GROUPS.get_or_init(|| {
         let membership = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
         let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mount_scope = std::env::var("RPROBE_CGROUP_SCOPE").is_ok_and(|scope| scope == "mount");
         Cgroups {
-            memory: locate(&membership, &mounts, "memory"),
-            cpu: locate(&membership, &mounts, "cpu"),
-            cpuacct: locate(&membership, &mounts, "cpuacct"),
+            memory: selected_scope(locate(&membership, &mounts, "memory"), mount_scope),
+            cpu: selected_scope(locate(&membership, &mounts, "cpu"), mount_scope),
+            cpuacct: selected_scope(locate(&membership, &mounts, "cpuacct"), mount_scope),
         }
     })
 }
@@ -228,4 +246,18 @@ mod tests {
         assert_eq!(quota("-1", "100000"), None);
         assert_eq!(quota("10000", "100000"), Some(0.1));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn mount_scope_is_explicit_and_stays_in_container_mount() {
+    let membership = "0::/system.slice/rprobe-agent.service";
+    let mounts = "29 23 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup rw";
+    let default = selected_scope(locate(membership, mounts, "memory"), false).unwrap();
+    assert_eq!(
+        default.directory,
+        Path::new("/sys/fs/cgroup/system.slice/rprobe-agent.service")
+    );
+    let container = selected_scope(locate(membership, mounts, "memory"), true).unwrap();
+    assert_eq!(container.directory, Path::new("/sys/fs/cgroup"));
 }

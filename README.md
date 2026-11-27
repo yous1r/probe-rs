@@ -73,3 +73,7 @@ python3 scripts/verify_limits.py --bin-dir /path/to/artifact --output-dir /tmp/r
 This uses a temporary systemd unit and removes it after the test. CPU results include both percent of one logical CPU and percent of the 0.1-CPU allowance. These loopback tests do not validate TLS termination or Linux 2.6.32 compatibility.
 
 The collection and transport design was compared with [ServerStatus-Rust](https://github.com/zdz/ServerStatus-Rust), especially its interface filtering and bounded network timeouts. rprobe retains its direct procfs/cgroup collector and synchronous transport to match its memory and legacy-kernel constraints; no implementation source was copied.
+
+For an agent installed as a dedicated systemd service to monitor the whole VPS/container, set `RPROBE_CGROUP_SCOPE=mount` in that service. This reads counters and quotas at the mounted cgroup root instead of the agent service's child cgroup. The default `process` scope remains suitable for agents embedded in application containers. Use `mount` only when the mount root represents the machine/container you intend to monitor.
+
+The server holds an exclusive `.lock` file beside the SQLite file for its lifetime; only one server process may use a registry. Do not remove that lock file while the server is running. Unknown SQLite schemas or versions are rejected before changing journal mode.

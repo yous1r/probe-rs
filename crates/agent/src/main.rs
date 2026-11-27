@@ -18,6 +18,7 @@ fn main() {
 fn run_cli() -> Result<()> {
     let config = parse_args()?;
     collector::require_procfs()?;
+    cgroup::validate_scope()?;
     run(config)
 }
 
